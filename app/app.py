@@ -4,8 +4,9 @@ Run from the repo root:   py -3.9 -m streamlit run app/app.py
 
 Tabs
   1. Predict           - paste / upload a resume, get category + department
-  2. Batch             - upload many resumes, get a table + CSV download
-  3. Model evaluation  - test accuracy, macro-F1, per-class + per-department scores,
+  2. Compare models    - SVM vs Word2Vec + Dense NN: accuracy comparison and side-by-side prediction
+  3. Batch             - upload many resumes, get a table + CSV download
+  4. Model evaluation  - test accuracy, macro-F1, per-class + per-department scores,
                          confusion matrix, errors (read from reports/ saved by src/train.py)
 """
 import sys
@@ -19,6 +20,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.departments import get_department  # noqa: E402
+from src.dl_model import predict_category_dl  # noqa: E402
 from src.predict import SAMPLES, load_model, predict_category  # noqa: E402  (backend)
 
 st.set_page_config(page_title="Resume Classifier", page_icon="📄", layout="wide")
@@ -113,13 +115,14 @@ with st.sidebar:
         "1. Upload a resume (.txt / .pdf) **or** paste its text\n"
         "2. Click **Predict category**\n"
         "3. Use the slider to see more categories\n"
-        "4. Try **Batch** for many resumes, and **Model evaluation** to see how reliable "
+        "4. **Compare models** shows SVM vs the neural network\n"
+        "5. Try **Batch** for many resumes, and **Model evaluation** to see how reliable "
         "the model is"
     )
     st.divider()
     st.header("About the model")
-    st.write("TF-IDF text features + Linear SVM, trained to recognise 24 resume categories. "
-             "Each category is also mapped to a broader department.")
+    st.write("Final model: TF-IDF + Linear SVM (24 categories). A Word2Vec + Dense neural "
+             "network is also trained for comparison. Each category maps to a department.")
     st.caption("Categories with similar vocabulary (for example Finance and Accountant) "
                "can be confused.")
 
@@ -127,8 +130,8 @@ with st.sidebar:
 st.title("📄 Resume Classifier")
 st.write("Find out which job category and department a resume belongs to.")
 
-tab_predict, tab_batch, tab_eval = st.tabs(
-    ["🔮 Predict", "📚 Batch", "📊 Model evaluation"])
+tab_predict, tab_compare, tab_batch, tab_eval = st.tabs(
+    ["🔮 Predict", "⚖️ Compare models", "📚 Batch", "📊 Model evaluation"])
 
 # =====================================================================
 # TAB 1: PREDICT
@@ -254,7 +257,69 @@ with tab_predict:
                            "scores, not percentages.")
 
 # =====================================================================
-# TAB 2: BATCH
+# TAB 2: COMPARE MODELS (SVM vs Word2Vec + Dense NN)
+# =====================================================================
+with tab_compare:
+    st.subheader("Accuracy comparison on the same test resumes")
+    comp = read_report("model_compare_svm_vs_dl.csv")
+    if comp is None:
+        st.info("Run  `py -3.9 src\\train_dl.py`  first to create the comparison.")
+    else:
+        test_df = comp[comp["split"] == "test"].copy()
+        long_df = test_df.melt(id_vars=["model"],
+                               value_vars=["accuracy", "macro_f1", "weighted_f1"],
+                               var_name="Metric", value_name="Score")
+        long_df["Metric"] = long_df["Metric"].map(
+            {"accuracy": "Accuracy", "macro_f1": "Macro-F1", "weighted_f1": "Weighted-F1"})
+        long_df = long_df.rename(columns={"model": "Model"})
+        cmp_chart = (
+            alt.Chart(long_df).mark_bar()
+            .encode(x=alt.X("Model:N", title=None, axis=alt.Axis(labels=False)),
+                    y=alt.Y("Score:Q", scale=alt.Scale(domain=[0, 1])),
+                    color="Model:N", column=alt.Column("Metric:N", title=None),
+                    tooltip=["Model", "Metric", alt.Tooltip("Score:Q", format=".3f")])
+            .properties(width=160, height=300)
+        )
+        st.altair_chart(cmp_chart)
+        shown = comp.rename(columns={"model": "Model", "split": "Split", "accuracy": "Accuracy",
+                                     "macro_f1": "Macro-F1", "weighted_f1": "Weighted-F1"})
+        st.dataframe(shown.round(3), hide_index=True)
+        st.caption("Both models use the same 70/15/15 stratified split. Word2Vec was trained on "
+                   "the training resumes only. The SVM is the final model because it has the "
+                   "higher macro-F1.")
+
+    st.subheader("Try both models on one resume")
+    text_cmp = st.session_state.get("resume_text", "")
+    if not text_cmp.strip():
+        st.info("Add a resume in the Predict tab first (upload, paste or sample), then come back.")
+    elif st.button("⚖️ Compare predictions", key="cmp_btn"):
+        svm_res = predict_category(text_cmp, top_k=3)
+        try:
+            dl_res = predict_category_dl(text_cmp, top_k=3)
+        except Exception as err:
+            dl_res = None
+            st.error(f"Deep-learning model could not run: {err}")
+        if dl_res is not None:
+            a, b = st.columns(2)
+            for col, title, res, note in [
+                (a, "TF-IDF + Linear SVM", svm_res, "decision scores"),
+                (b, "Word2Vec + Dense NN", dl_res, "probabilities")]:
+                with col:
+                    st.markdown(
+                        f'<div class="result-card"><div class="result-label">{title}</div>'
+                        f'<div class="result-value">{pretty(res["category"])}</div>'
+                        f'<div class="dept-badge">🏢 {get_department(res["category"])}</div></div>',
+                        unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame({
+                        "Closest categories": [pretty(c) for c, _ in res["top"]],
+                        note.title(): [round(s, 3) for _, s in res["top"]]}), hide_index=True)
+            if svm_res["category"] == dl_res["category"]:
+                st.success("Both models agree on the category.")
+            else:
+                st.warning("The models disagree. The SVM is the more accurate model overall.")
+
+# =====================================================================
+# TAB 3: BATCH
 # =====================================================================
 with tab_batch:
     st.subheader("Classify many resumes at once")
@@ -289,7 +354,7 @@ with tab_batch:
                     'of categories and departments.</div>', unsafe_allow_html=True)
 
 # =====================================================================
-# TAB 3: MODEL EVALUATION
+# TAB 4: MODEL EVALUATION
 # =====================================================================
 with tab_eval:
     report = read_report("test_classification_report.csv", index_col=0)
